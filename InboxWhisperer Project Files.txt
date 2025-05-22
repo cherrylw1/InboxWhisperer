@@ -1,0 +1,388 @@
+# requirements.txt
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+nltk
+pandas
+beautifulsoup4
+
+# .gitignore
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.dist-info/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# PyInstaller
+# *.manifest
+# *.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# Token file (specific to this project)
+token.pickle
+
+# config.py
+# Gmail API credentials file name
+CREDENTIALS_FILE = 'credentials.json'
+
+# Token file name for storing OAuth2 tokens
+TOKEN_FILE = 'token.pickle'
+
+# High priority keywords (case-insensitive)
+HIGH_PRIORITY_KEYWORDS = ['urgent', 'important', 'action required']
+
+# High priority senders (list of email addresses)
+HIGH_PRIORITY_SENDERS = ['[email protected]', '[email protected]']
+
+# Output CSV file name
+OUTPUT_CSV = 'email_report.csv'
+
+# utils.py
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize, sent_tokenize
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import base64
+from bs4 import BeautifulSoup
+
+# Download NLTK data if not already downloaded
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('vader_lexicon', quiet=True)
+
+def summarize_text(text):
+    """Summarize text using extractive summarization with NLTK."""
+    stopWords = set(stopwords.words("english"))
+    words = word_tokenize(text)
+    freqTable = dict()
+    for word in words:
+        word = word.lower()
+        if word in stopWords:
+            continue
+        if word in freqTable:
+            freqTable[word] += 1
+        else:
+            freqTable[word] = 1
+    sentences = sent_tokenize(text)
+    sentenceValue = dict()
+    for sentence in sentences:
+        for word, freq in freqTable.items():
+            if word in sentence.lower():
+                if sentence in sentenceValue:
+                    sentenceValue[sentence] += freq
+                else:
+                    sentenceValue[sentence] = freq
+    sumValues = 0
+    for sentence in sentenceValue:
+        sumValues += sentenceValue[sentence]
+    average = int(sumValues / len(sentenceValue)) if sentenceValue else 0
+    summary = ''
+    for sentence in sentences:
+        if sentence in sentenceValue and sentenceValue[sentence] > (1.2 * average):
+            summary += " " + sentence
+    return summary.strip()
+
+def analyze_sentiment(text):
+    """Analyze sentiment using NLTK's VADER SentimentIntensityAnalyzer."""
+    sid = SentimentIntensityAnalyzer()
+    return sid.polarity_scores(text)['compound']
+
+def is_high_priority(subject, body, sender, high_priority_keywords, high_priority_senders):
+    """Tag email as high priority based on keywords or sender."""
+    if sender in high_priority_senders:
+        return True
+    for keyword in high_priority_keywords:
+        if keyword.lower() in subject.lower() or keyword.lower() in body.lower():
+            return True
+    return False
+
+def get_body(message):
+    """Extract email body from Gmail API message payload."""
+    if 'payload' in message:
+        payload = message['payload']
+        if 'parts' in payload:
+            for part in payload['parts']:
+                if part['mimeType'] == 'text/plain':
+                    return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                elif part['mimeType'] == 'text/html':
+                    html = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                    soup = BeautifulSoup(html, 'html.parser')
+                    return soup.get_text()
+        else:
+            if payload['mimeType'] == 'text/plain':
+                return base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8')
+            elif payload['mimeType'] == 'text/html':
+                html = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8')
+                soup = BeautifulSoup(html, 'html.parser')
+                return soup.get_text()
+    return ""
+
+# main.py
+from __future__ import print_function
+import pickle
+import os.path
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pandas as pd
+from utils import summarize_text, analyze_sentiment, is_high_priority, get_body
+from config import CREDENTIALS_FILE, TOKEN_FILE, HIGH_PRIORITY_KEYWORDS, HIGH_PRIORITY_SENDERS, OUTPUT_CSV
+
+# Define Gmail API scopes for read-only access
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+def get_unread_emails(service):
+    """Fetch up to 10 unread emails from Gmail."""
+    result = service.users().messages().list(userId='me', labelIds=['UNREAD'], maxResults=10).execute()
+    messages = result.get('messages', [])
+    return messages
+
+def get_message(service, msg_id):
+    """Retrieve full email content by message ID."""
+    message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+    return message
+
+def main():
+    """Main function to process emails and generate report."""
+    # Authenticate with Gmail API
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_FILE, 'wb') as token:
+            pickle.dump(creds, token)
+
+    # Build Gmail API service
+    service = build('gmail', 'v1', credentials=creds)
+
+    # Fetch unread emails
+    messages = get_unread_emails(service)
+    if not messages:
+        print("No unread emails found.")
+        return
+
+    # Process each email
+    report_data = []
+    for msg in messages:
+        message = get_message(service, msg['id'])
+        # Get subject
+        subject = "No Subject"
+        for header in message['payload']['headers']:
+            if header['name'] == 'Subject':
+                subject = header['value']
+                break
+        # Get sender
+        sender = "Unknown Sender"
+        for header in message['payload']['headers']:
+            if header['name'] == 'From':
+                sender = header['value']
+                break
+        # Get body
+        body = get_body(message)
+        # Summarize
+        summary = summarize_text(body) or "No summary available"
+        # Analyze sentiment
+        sentiment = analyze_sentiment(body)
+        # Check priority
+        priority = 'high' if is_high_priority(subject, body, sender, HIGH_PRIORITY_KEYWORDS, HIGH_PRIORITY_SENDERS) else 'normal'
+        # Store data
+        report_data.append({
+            'Email ID': msg['id'],
+            'Subject': subject,
+            'Summary': summary,
+            'Sentiment': sentiment,
+            'Priority': priority
+        })
+
+    # Create DataFrame and save to CSV
+    df = pd.DataFrame(report_data)
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Report generated: {OUTPUT_CSV}")
+
+if __name__ == '__main__':
+    main()
+
+# README.md
+# InboxWhisperer - Smart Email Summarizer & Prioritizer
+
+## Project Description
+InboxWhisperer is a Python tool that connects to your Gmail account, summarizes unread emails, tags them by priority and sentiment, and exports a report. It uses the Gmail API to fetch emails, NLTK for summarization and sentiment analysis, and Pandas for report generation.
+
+## Key Features
+- Connects to Gmail using the Gmail API.
+- Summarizes email bodies using extractive summarization with NLTK.
+- Analyzes sentiment of emails using NLTK's SentimentIntensityAnalyzer.
+- Tags emails as high priority based on configurable keywords or senders.
+- Exports a CSV report with summaries, sentiments, and priorities.
+
+## Real-world Use Cases
+- Quickly review important emails without reading them fully.
+- Prioritize emails based on content or sender.
+- Keep a record of email summaries for reference.
+
+## Installation Steps
+1. **Clone this repository**:
+   ```bash
+   git clone https://github.com/yourusername/InboxWhisperer.git
+   ```
+
+2. **Set up a Google Cloud project and enable the Gmail API**:
+   - Go to [Google Cloud Console](https://console.cloud.google.com/).
+   - Create a new project.
+   - Navigate to API Library and search for "Gmail API."
+   - Enable the Gmail API.
+   - Configure OAuth consent screen (select Internal for simplicity).
+   - Create OAuth 2.0 credentials (Desktop app).
+   - Download the `credentials.json` file and place it in the project directory.
+
+3. **Create a virtual environment (optional)**:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+4. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+5. **Download NLTK data**:
+   In the project directory, run:
+   ```python
+   import nltk
+   nltk.download('punkt')
+   nltk.download('stopwords')
+   nltk.download('vader_lexicon')
+   ```
+
+## How to Run
+1. Run the main script:
+   ```bash
+   python main.py
+   ```
+
+2. When prompted, authorize the app via the browser and follow the OAuth flow instructions.
+
+3. The script will fetch up to 10 unread emails, process them, and generate a CSV report named `email_report.csv` in the project directory.
+
+## Sample Output
+The `email_report.csv` file will contain columns:
+- **Email ID**: Unique identifier for the email.
+- **Subject**: Email subject line.
+- **Summary**: Extracted summary of the email body.
+- **Sentiment**: Compound sentiment score (-1 to 1, where positive is >0).
+- **Priority**: High or normal, based on keywords or sender.
+
+Example `email_report.csv`:
+```csv
+Email ID,Subject,Summary,Sentiment,Priority
+12345,Urgent: Project Deadline,Project due tomorrow,0.3,high
+67890,Meeting Notes,Team discussed goals,0.7,normal
+```
+
+## Configuration
+Edit `config.py` to customize:
+- `HIGH_PRIORITY_KEYWORDS`: Add keywords like 'urgent' or 'important'.
+- `HIGH_PRIORITY_SENDERS`: Add email addresses for priority senders.
+Example:
+```python
+HIGH_PRIORITY_KEYWORDS = ['urgent', 'important', 'action required']
+HIGH_PRIORITY_SENDERS = ['[email protected]', '[email protected]']
+```
+
+## Note
+- Ensure the `credentials.json` file is in the project directory.
+- The project processes up to 10 unread emails to avoid excessive API calls; modify `maxResults` in `main.py` if needed.
+- For advanced summarization, consider integrating models like BERT, though this increases complexity.
